@@ -1,7 +1,13 @@
-name: Extract JARVIS ZIP
+name: Extract Project ZIP
 
 on:
   workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "Path to ZIP file relative to repository root (leave empty to auto-detect)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -9,65 +15,227 @@ permissions:
 jobs:
   extract:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Extract project ZIP
-        run: |
-          python3 - <<'PY'
-          import zipfile
-          import pathlib
-          import shutil
-          import tempfile
-
-          root = pathlib.Path.cwd()
-          zips = list(root.glob("*.zip"))
-
-          if len(zips) != 1:
-              raise SystemExit(
-                  f"Expected exactly one ZIP in repository root, found {len(zips)}"
-              )
-
-          zip_file = zips[0]
-          temp = pathlib.Path(tempfile.mkdtemp())
-
-          with zipfile.ZipFile(zip_file) as archive:
-              for item in archive.infolist():
-                  name = pathlib.PurePosixPath(item.filename)
-                  if name.is_absolute() or ".." in name.parts:
-                      raise ValueError("Unsafe ZIP path: " + item.filename)
-
-              archive.extractall(temp)
-
-          entries = list(temp.iterdir())
-
-          if (len(entries) == 1 and entries[0].is_dir()):
-              source = entries[0]
-          else:
-              source = temp
-
-          for item in source.iterdir():
-              destination = root / item.name
-
-              if item.is_dir():
-                  shutil.copytree(
-                      item, destination, dirs_exist_ok=True
-                  )
-              else:
-                  shutil.copy2(item, destination)
-
-          zip_file.unlink()
-          shutil.rmtree(temp)
-
-          print("JARVIS project extracted successfully!")
-          PY
-
-      - name: Commit extracted files
+      - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Locate ZIP file
+        id: locate
+        env:
+          INPUT_ZIP: ${{ inputs.zip_path }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, pathlib
+
+          root = pathlib.Path(".")
+          input_zip = os.environ.get("INPUT_ZIP", "").strip()
+
+          if input_zip:
+              zpath = pathlib.Path(input_zip)
+              if not zpath.exists() or not zpath.is_file():
+                  sys.exit(f"❌ Specified ZIP not found: {input_zip}")
+              if zpath.suffix.lower() != ".zip":
+                  sys.exit(f"❌ Not a .zip file: {input_zip}")
+              print(f"ZIP_PATH={zpath.as_posix()}")
+              sys.exit(0)
+
+          zips = [
+              p for p in root.rglob("*")
+              if p.is_file() and p.suffix.lower() == ".zip"
+          ]
+
+          if not zips:
+              sys.exit("❌ No .zip file found anywhere in the repository.")
+
+          if len(zips) > 1:
+              sys.exit(
+                  "❌ Multiple ZIP files found. Please set the 'zip_path' input to one of:\n"
+                  + "\n".join(f"  - {p.as_posix()}" for p in zips)
+              )
+
+          print(f"ZIP_PATH={zips[0].as_posix()}")
+          PY
+        # The Python block above prints ZIP_PATH=... to stdout.
+        # We capture it via shell redirection below.
+        # (GitHub Actions does not allow setting outputs directly from Python stdout,
+        #  so we use a two-step approach.)
+
+      - name: Resolve ZIP path to env
+        id: resolve
+        run: |
+          # Re-run the detection logic and export to GITHUB_OUTPUT
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, pathlib, sys
+
+          root = pathlib.Path(".")
+          input_zip = os.environ.get("INPUT_ZIP", "").strip()
+
+          if input_zip:
+              zpath = pathlib.Path(input_zip)
+              if not zpath.exists() or not zpath.is_file() or zpath.suffix.lower() != ".zip":
+                  sys.exit(1)
+              print(f"zip_path={zpath.as_posix()}")
+              sys.exit(0)
+
+          zips = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".zip"]
+          if len(zips) == 0:
+              sys.exit(1)
+          if len(zips) > 1:
+              sys.exit(1)
+          print(f"zip_path={zips[0].as_posix()}")
+          PY
+        env:
+          INPUT_ZIP: ${{ inputs.zip_path }}
+
+      - name: Safe extract and validate
+        id: extract
+        env:
+          ZIP_PATH: ${{ steps.resolve.outputs.zip_path }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, zipfile, pathlib, shutil, tempfile
+
+          zip_path = pathlib.Path(os.environ["ZIP_PATH"])
+          if not zip_path.exists():
+              sys.exit(f"❌ ZIP disappeared: {zip_path}")
+
+          repo_root = pathlib.Path(".").resolve()
+
+          # 1) Validate every member BEFORE extracting anything (Zip Slip protection)
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  sys.exit(f"❌ Corrupt ZIP entry: {bad}")
+
+              members = zf.infolist()
+              if not members:
+                  sys.exit("❌ ZIP is empty.")
+
+              for m in members:
+                  # Resolve target path and ensure it stays inside repo_root
+                  target = (repo_root / m.filename).resolve()
+                  try:
+                      target.relative_to(repo_root)
+                  except ValueError:
+                      sys.exit(
+                          f"❌ ZIP path traversal detected: {m.filename!r} "
+                          f"would escape {repo_root}"
+                      )
+
+              # 2) Extract into a temporary staging directory first
+              staging = pathlib.Path(tempfile.mkdtemp(prefix="unzip_", dir=repo_root))
+              try:
+                  zf.extractall(path=staging)
+              except Exception as e:
+                  shutil.rmtree(staging, ignore_errors=True)
+                  sys.exit(f"❌ Extraction failed: {e}")
+
+          # 3) Detect single top-level folder
+          children = list(staging.iterdir())
+          top_level_dirs = [c for c in children if c.is_dir() and not c.is_symlink()]
+          top_level_files = [c for c in children if not c.is_dir() or c.is_symlink()]
+
+          if len(children) == 1 and len(top_level_dirs) == 1:
+              # ZIP contains exactly one top-level folder: move its contents up
+              project_root = top_level_dirs[0]
+              source_items = list(project_root.iterdir())
+          else:
+              # ZIP contains files directly at root (or mixed): use staging as root
+              project_root = staging
+              source_items = children
+
+          if not source_items:
+              shutil.rmtree(staging, ignore_errors=True)
+              sys.exit("❌ No files found after extraction.")
+
+          # 4) Validate: ensure at least one recognizable project file exists
+          names = {p.name.lower() for p in source_items if p.is_file()}
+          # Android project markers (at least one should be present)
+          markers = {
+              "build.gradle", "build.gradle.kts", "settings.gradle",
+              "settings.gradle.kts", "gradlew", "androidmanifest.xml",
+              "gradle.properties"
+          }
+          if not (names & markers):
+              shutil.rmtree(staging, ignore_errors=True)
+              sys.exit(
+                  "❌ Extracted content does not look like an Android project. "
+                  f"Top-level files: {sorted(names)[:20]}"
+              )
+
+          # 5) Copy into repository root WITHOUT deleting existing unrelated files
+          #    Existing files with the same name will be overwritten.
+          print("Copying extracted files into repository root…")
+          for item in source_items:
+              dest = repo_root / item.name
+              if item.is_dir():
+                  if dest.exists() and not dest.is_dir():
+                      shutil.rmtree(dest, ignore_errors=True)
+                  shutil.copytree(item, dest, dirs_exist_ok=True)
+              else:
+                  if dest.exists() and dest.is_dir():
+                      shutil.rmtree(dest, ignore_errors=True)
+                  shutil.copy2(item, dest)
+
+          shutil.rmtree(staging, ignore_errors=True)
+
+          # 6) Validate that the repository now contains the project
+          if not any((repo_root / m).exists() for m in markers):
+              sys.exit("❌ Post-copy validation failed: Android project markers missing.")
+
+          print("✅ Extraction and validation successful.")
+          PY
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+
           git add -A
-          git commit -m "Extract complete JARVIS project" || echo "No changes"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: extract uploaded ZIP project"
+
+          # GITHUB_TOKEN with contents: write is sufficient for pushing
+          git push origin HEAD:${{ github.ref_name }}
+
+      - name: Remove original ZIP (only after successful commit)
+        env:
+          ZIP_PATH: ${{ steps.resolve.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZIP_PATH:-}" ]; then
+            echo "ℹ️ No ZIP path resolved; skipping removal."
+            exit 0
+          fi
+
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "ℹ️ ZIP already removed; nothing to do."
+            exit 0
+          fi
+
+          # Safety: the ZIP must be inside the repository
+          repo_root="$(pwd)"
+          real_zip="$(realpath "$ZIP_PATH")"
+          case "$real_zip" in
+            "$repo_root"/*) ;;
+            *) echo "❌ Refusing to delete ZIP outside repository."; exit 1 ;;
+          esac
+
+          git rm --quiet -- "$ZIP_PATH"
+          git commit -m "chore: remove original ZIP after successful extraction"
+          git push origin HEAD:${{ github.ref_name }}
+          echo "✅ Original ZIP removed and committed."
