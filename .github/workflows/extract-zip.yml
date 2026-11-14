@@ -1,0 +1,73 @@
+name: Extract JARVIS ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          import pathlib
+          import shutil
+          import tempfile
+
+          root = pathlib.Path.cwd()
+          zips = list(root.glob("*.zip"))
+
+          if len(zips) != 1:
+              raise SystemExit(
+                  f"Expected exactly one ZIP in repository root, found {len(zips)}"
+              )
+
+          zip_file = zips[0]
+          temp = pathlib.Path(tempfile.mkdtemp())
+
+          with zipfile.ZipFile(zip_file) as archive:
+              for item in archive.infolist():
+                  name = pathlib.PurePosixPath(item.filename)
+                  if name.is_absolute() or ".." in name.parts:
+                      raise ValueError("Unsafe ZIP path: " + item.filename)
+
+              archive.extractall(temp)
+
+          entries = list(temp.iterdir())
+
+          if (len(entries) == 1 and entries[0].is_dir()):
+              source = entries[0]
+          else:
+              source = temp
+
+          for item in source.iterdir():
+              destination = root / item.name
+
+              if item.is_dir():
+                  shutil.copytree(
+                      item, destination, dirs_exist_ok=True
+                  )
+              else:
+                  shutil.copy2(item, destination)
+
+          zip_file.unlink()
+          shutil.rmtree(temp)
+
+          print("JARVIS project extracted successfully!")
+          PY
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Extract complete JARVIS project" || echo "No changes"
+          git push
