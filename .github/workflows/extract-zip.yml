@@ -1,3 +1,4 @@
+
 name: Extract Project ZIP
 
 on:
@@ -21,7 +22,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Configure Git
         run: |
@@ -36,76 +37,151 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, sys, zipfile, pathlib, shutil, stat, subprocess
+          import os, sys, zipfile, pathlib, shutil, stat
 
-          repo_root      = pathlib.Path(".").resolve()
-          zip_input      = (os.environ.get("INPUT_ZIP") or "").strip()
-          workflow_file  = os.environ.get("WORKFLOW_FILE", "")
-          runner_temp    = pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+          MAX_ENTRIES = 50_000
+          MAX_TOTAL_UNCOMPRESSED = 2 * 1024**3
+          MAX_ENTRY_UNCOMPRESSED = 500 * 1024**2
+          MAX_COMPRESSION_RATIO = 200
+          SMALL_FILE_THRESHOLD = 1 * 1024**2
 
-          def fail(msg):
-              print(f"::error::{msg}", file=sys.stderr)
+          repo_root = pathlib.Path(".").resolve()
+          zip_input = (os.environ.get("INPUT_ZIP") or "").strip()
+          workflow_file = os.environ.get("WORKFLOW_FILE", "")
+          runner_temp = pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+
+          def log(m):
+              print(m, flush=True)
+
+          def fail(m):
+              print(f"::error::{m}", file=sys.stderr)
               sys.exit(1)
 
-          # ── 1. Locate the ZIP exactly once ─────────────────────────
+          # 1. Locate ZIP
           if zip_input:
-              zip_path = (repo_root / zip_input).resolve()
+              supplied = pathlib.PurePosixPath(zip_input)
+
+              if supplied.is_absolute() or pathlib.Path(zip_input).is_absolute():
+                  fail("zip_path must be relative to the repository root.")
+
+              raw = repo_root
+              for part in supplied.parts:
+                  if part in ("", "."):
+                      continue
+                  if part == "..":
+                      if raw == repo_root:
+                          fail("zip_path attempts to escape the repository.")
+                      raw = raw.parent
+                      continue
+
+                  raw = raw / part
+
+                  if raw.is_symlink():
+                      fail(
+                          "Symbolic link in ZIP path components: "
+                          f"{raw.relative_to(repo_root).as_posix()}"
+                      )
+
+                  if not raw.exists():
+                      break
+
+              try:
+                  raw.relative_to(repo_root)
+              except ValueError:
+                  fail("zip_path escapes repository.")
+
+              if raw.is_symlink():
+                  fail(f"ZIP path is a symbolic link: {zip_input}. Refusing.")
+              if not raw.exists():
+                  fail(f"ZIP not found: {zip_input}")
+              if not raw.is_file():
+                  fail(f"ZIP is not a regular file: {zip_input}")
+              if raw.suffix.casefold() != ".zip":
+                  fail(f"Not a .zip file: {zip_input}")
+
+              zip_path = raw.resolve()
               try:
                   zip_path.relative_to(repo_root)
               except ValueError:
-                  fail(f"zip_path must be inside the repository: {zip_input}")
-              if not zip_path.is_file():
-                  fail(f"ZIP not found: {zip_input}")
-              if zip_path.suffix.lower() != ".zip":
-                  fail(f"Not a .zip file: {zip_input}")
+                  fail(f"zip_path escapes repository after resolution: {zip_input}")
+
           else:
-              zips = sorted(
-                  p for p in repo_root.iterdir()
-                  if p.is_file() and p.suffix.lower() == ".zip"
-              )
-              if not zips:
-                  fail("No .zip file in repository root. "
-                       "Upload one or set the zip_path input.")
-              if len(zips) > 1:
-                  fail("Multiple .zip files in repository root: "
-                       + ", ".join(p.name for p in zips)
-                       + ". Set the zip_path input to choose one.")
-              zip_path = zips[0]
+              candidates = []
+              for p in repo_root.iterdir():
+                  if p.suffix.casefold() != ".zip":
+                      continue
+                  if p.is_symlink():
+                      fail(f"ZIP in repository root is a symbolic link: {p.name}")
+                  if p.is_file():
+                      candidates.append(p)
+
+              if not candidates:
+                  fail("No .zip file in repository root. Upload one or set zip_path.")
+              if len(candidates) > 1:
+                  fail(
+                      "Multiple .zip files in repository root: "
+                      + ", ".join(p.name for p in candidates)
+                      + ". Set the zip_path input to choose one."
+                  )
+              zip_path = candidates[0]
 
           rel_zip = zip_path.relative_to(repo_root).as_posix()
-          print(f"Found ZIP: {rel_zip}")
+          log(f"Found ZIP: {rel_zip}")
 
-          if os.environ.get("GITHUB_OUTPUT"):
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write(f"zip_path={rel_zip}\n")
-
-          # ── 2. Open and validate every archive member ──────────────
+          # 2. Open ZIP and enforce declared-size limits
           try:
               zf = zipfile.ZipFile(zip_path)
           except zipfile.BadZipFile as e:
               fail(f"Cannot open ZIP: {e}")
 
-          PROTECTED_TOP = {".git"}
-
           with zf:
+              infos = zf.infolist()
+              if not infos:
+                  fail("ZIP is empty.")
+              if len(infos) > MAX_ENTRIES:
+                  fail(f"Too many entries: {len(infos)} > {MAX_ENTRIES}")
+
+              total_size = 0
+              for m in infos:
+                  if m.is_dir():
+                      continue
+                  if m.file_size > MAX_ENTRY_UNCOMPRESSED:
+                      fail(
+                          f"Entry too large: {m.filename} "
+                          f"({m.file_size} B > {MAX_ENTRY_UNCOMPRESSED} B)"
+                      )
+                  if m.file_size > SMALL_FILE_THRESHOLD:
+                      if m.compress_size == 0:
+                          fail(
+                              f"Suspicious: {m.filename} has "
+                              f"{m.file_size} B uncompressed but 0 B compressed"
+                          )
+                      ratio = m.file_size / m.compress_size
+                      if ratio > MAX_COMPRESSION_RATIO:
+                          fail(
+                              f"Suspicious compression ratio for {m.filename}: "
+                              f"{ratio:.1f}:1"
+                          )
+                  total_size += m.file_size
+
+              if total_size > MAX_TOTAL_UNCOMPRESSED:
+                  fail(
+                      f"Total declared uncompressed size {total_size} B "
+                      f"> {MAX_TOTAL_UNCOMPRESSED} B"
+                  )
+
               bad = zf.testzip()
               if bad is not None:
                   fail(f"Corrupt ZIP member: {bad}")
 
-              infos = zf.infolist()
-              if not infos:
-                  fail("ZIP is empty.")
-
-              files  = {}
-              dirs   = set()
+              files = {}
+              dirs = set()
 
               for m in infos:
                   name = m.filename
 
-                  # NUL / control characters
                   if any(ord(c) < 0x20 for c in name):
                       fail(f"Control character in ZIP path: {name!r}")
-
                   if name.startswith("/"):
                       fail(f"Absolute path in ZIP: {name!r}")
                   if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
@@ -114,29 +190,21 @@ jobs:
                       fail(f"Backslash in ZIP path: {name!r}")
 
                   parts = name.rstrip("/").split("/")
-                  if any(p == ".." for p in parts):
-                      fail(f"'..' path component in ZIP: {name!r}")
-                  if any(p == "." for p in parts):
-                      fail(f"'.' path component in ZIP: {name!r}")
-                  if any(p == "" for p in parts):
-                      fail(f"Empty path component in ZIP: {name!r}")
+                  if any(p in ("", ".", "..") for p in parts):
+                      fail(f"Invalid path component in ZIP: {name!r}")
 
-                  # Reject every Unix-special file type.  Modes with only
-                  # permission bits (e.g. 0o644, 0o600 from writestr())
-                  # return False for all S_IS* checks, so Python-generated
-                  # ZIPs are unaffected.
+                  if any(p.casefold() == ".git" for p in parts):
+                      fail(f"ZIP touches .git at: {name!r}")
+
                   mode = (m.external_attr >> 16) & 0xFFFF
                   if stat.S_ISLNK(mode):
-                      fail(f"Symlink in ZIP: {name!r}. Refusing to extract.")
+                      fail(f"Symlink in ZIP: {name!r}")
                   if stat.S_ISFIFO(mode):
-                      fail(f"FIFO in ZIP: {name!r}. Refusing to extract.")
+                      fail(f"FIFO in ZIP: {name!r}")
                   if stat.S_ISSOCK(mode):
-                      fail(f"Socket in ZIP: {name!r}. Refusing to extract.")
+                      fail(f"Socket in ZIP: {name!r}")
                   if stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
-                      fail(f"Device file in ZIP: {name!r}. Refusing to extract.")
-
-                  if parts[0] in PROTECTED_TOP:
-                      fail(f"ZIP touches protected path {parts[0]!r}: {name!r}")
+                      fail(f"Device file in ZIP: {name!r}")
 
                   if name.endswith("/"):
                       dirs.add(name.rstrip("/"))
@@ -147,235 +215,435 @@ jobs:
                       for i in range(1, len(parts)):
                           dirs.add("/".join(parts[:i]))
 
-              lower = {}
-              for n in files:
-                  k = n.lower()
-                  if k in lower:
-                      fail(f"Case-insensitive collision in ZIP: "
-                           f"{n!r} vs {lower[k]!r}")
-                  lower[k] = n
+              # 3. Comprehensive archive path collision validation
+              path_registry = {}
 
-              both = set(files) & dirs
-              if both:
-                  fail("Archive path is both file and directory: "
-                       f"{sorted(both)[:10]}")
+              def register(path, kind):
+                  key = path.casefold()
+                  if key in path_registry:
+                      prev_path, prev_kind = path_registry[key]
+                      if prev_path != path:
+                          fail(
+                              "Case-insensitive path collision in ZIP: "
+                              f"{prev_kind} {prev_path!r} vs {kind} {path!r}"
+                          )
+                      if prev_kind != kind:
+                          fail(f"Path {path!r} is both {prev_kind} and {kind}")
+                  else:
+                      path_registry[key] = (path, kind)
+
+              for f in sorted(files):
+                  register(f, "file")
+              for d in sorted(dirs):
+                  register(d, "dir")
 
               all_names = sorted(files)
 
-              # ── 3. Strip redundant top-level folder(s) ─────────────
+              # 4. Strip redundant top-level folders
               ROOT_MARKERS = {
-                  "settings.gradle", "settings.gradle.kts",
-                  "build.gradle",    "build.gradle.kts",
+                  "settings.gradle",
+                  "settings.gradle.kts",
+                  "build.gradle",
+                  "build.gradle.kts",
               }
 
-              def stripped(name, prefix):
-                  return (name[len(prefix) + 1:]
-                          if prefix and name.startswith(prefix + "/")
-                          else name)
+              def stripped(n, prefix):
+                  return (
+                      n[len(prefix) + 1:]
+                      if prefix and n.startswith(prefix + "/")
+                      else n
+                  )
 
-              def root_marker_present(names):
-                  return any(("/" not in n) and (n in ROOT_MARKERS)
-                             for n in names)
+              def has_marker(names):
+                  return any(
+                      "/" not in n and n in ROOT_MARKERS
+                      for n in names
+                  )
 
               prefix = ""
               for _ in range(3):
                   cur = [stripped(n, prefix) for n in all_names]
-                  if root_marker_present(cur):
+                  if has_marker(cur):
                       break
+
                   tops = {n.split("/")[0] for n in cur}
                   if len(tops) != 1:
                       break
+
                   only = next(iter(tops))
-                  if not all(n == only or n.startswith(only + "/") for n in cur):
+                  if not all(n.startswith(only + "/") for n in cur):
                       break
-                  if not any(n.startswith(only + "/") for n in cur):
-                      break
+
                   prefix = f"{prefix}/{only}" if prefix else only
 
               final_names = [stripped(n, prefix) for n in all_names]
-
-              if not root_marker_present(final_names):
+              if not has_marker(final_names):
                   tops = sorted({n.split("/")[0] for n in final_names})[:20]
-                  fail("ZIP does not look like an Android/Gradle project: "
-                       "no settings.gradle{,.kts} or build.gradle{,.kts} "
-                       f"at project root (after stripping '{prefix or '<none>'}'). "
-                       f"Top-level entries: {tops}")
+                  fail(
+                      "ZIP does not look like an Android/Gradle project: "
+                      "no root Gradle marker after stripping "
+                      f"'{prefix or '<none>'}'. Top-level entries: {tops}"
+                  )
 
-              print(f"Project prefix stripped: {prefix or '<none>'}")
+              log(f"Project prefix stripped: {prefix or '<none>'}")
 
               if workflow_file and workflow_file in final_names:
-                  print(f"WARNING: ZIP contains {workflow_file}; it will be "
-                        f"ignored to avoid replacing the running workflow.",
-                        file=sys.stderr)
+                  log(f"WARNING: ZIP contains {workflow_file}; it will be ignored.")
 
-              # ── 4. Conflict report against current working tree ────
+              # 5. Existing repository conflict detection
               excluded = {rel_zip, workflow_file}
+              excluded_casefold = {e.casefold() for e in excluded if e}
 
-              target_files = [n for n in final_names if n not in excluded]
+              target_files = [
+                  n for n in final_names
+                  if n.casefold() not in excluded_casefold
+              ]
 
-              # Explicit empty directories from the archive (after strip)
               target_dirs = set()
               for d in dirs:
-                  rel = stripped(d, prefix)
-                  if not rel or rel in excluded:
+                  if prefix and d == prefix:
                       continue
-                  target_dirs.add(rel)
+                  rel = stripped(d, prefix)
+                  if rel and rel.casefold() not in excluded_casefold:
+                      target_dirs.add(rel)
 
-              # Ancestors of every file we will create
               for n in target_files:
                   parts = n.split("/")
                   for i in range(1, len(parts)):
                       target_dirs.add("/".join(parts[:i]))
 
+              repo_index = {}
+              for dp, dns, fns in os.walk(repo_root):
+                  if dp == str(repo_root):
+                      dns[:] = [d for d in dns if d != ".git"]
+
+                  rel_dir = os.path.relpath(dp, repo_root)
+                  if rel_dir == ".":
+                      rel_dir = ""
+
+                  for d in dns:
+                      rel = (rel_dir + "/" + d).lstrip("/")
+                      repo_index[rel.casefold()] = (rel, "dir")
+
+                  for f in fns:
+                      rel = (rel_dir + "/" + f).lstrip("/")
+                      repo_index[rel.casefold()] = (rel, "file")
+
+              def symlink_in_path(rel_path):
+                  cur = repo_root
+                  for p in rel_path.split("/"):
+                      cur = cur / p
+                      if cur.is_symlink():
+                          return cur.relative_to(repo_root).as_posix()
+                      if not cur.exists():
+                          return None
+                  return None
+
               conflicts = []
 
               for n in target_files:
-                  p = repo_root / n
-                  if p.is_symlink() or p.is_file():
-                      conflicts.append(("would-overwrite-existing-file", n))
-                  elif p.is_dir():
-                      conflicts.append(("existing-directory-blocks-archive-file", n))
+                  k = n.casefold()
+                  if k not in repo_index:
+                      continue
+
+                  actual, kind = repo_index[k]
+                  if actual == n:
+                      p = repo_root / n
+                      if p.is_symlink() or p.is_file():
+                          conflicts.append(("would-overwrite-existing-file", n))
+                      elif p.is_dir():
+                          conflicts.append(("existing-directory-blocks-file", n))
+                  else:
+                      conflicts.append(
+                          (f"case-insensitive-collision-with-{kind}:{actual}", n)
+                      )
 
               for d in target_dirs:
-                  p = repo_root / d
-                  if p.is_symlink() or p.is_file():
-                      conflicts.append(("existing-file-blocks-archive-directory", d))
+                  k = d.casefold()
+                  if k not in repo_index:
+                      continue
+
+                  actual, kind = repo_index[k]
+                  if actual != d:
+                      conflicts.append(
+                          (f"case-insensitive-collision-with-{kind}:{actual}", d)
+                      )
+                  elif kind == "file":
+                      conflicts.append(("existing-file-blocks-directory", d))
+
+              for n in list(target_files) + list(target_dirs):
+                  anc = symlink_in_path(n)
+                  if anc:
+                      conflicts.append((f"symlink-in-path:{anc}", n))
 
               if conflicts:
                   print("", file=sys.stderr)
                   print("=" * 64, file=sys.stderr)
-                  print("CONFLICT — installation would break the following paths:",
-                        file=sys.stderr)
+                  print("CONFLICT — installation would break these paths:", file=sys.stderr)
                   print("=" * 64, file=sys.stderr)
                   for kind, path in sorted(set(conflicts)):
                       print(f"  [{kind}] {path}", file=sys.stderr)
                   print("", file=sys.stderr)
-                  print("No files were changed and the ZIP is intact.",
-                        file=sys.stderr)
-                  print("", file=sys.stderr)
-                  print("To resolve, choose one:", file=sys.stderr)
-                  print("  A. Delete the listed repo files/directories via the",
-                        file=sys.stderr)
-                  print("     GitHub web UI, commit, then re-run this workflow.",
-                        file=sys.stderr)
-                  print("  B. Or remove those paths from the ZIP and re-upload it",
-                        file=sys.stderr)
-                  print("     if the repository copies should win.", file=sys.stderr)
+                  print("No files were changed and the ZIP is intact.", file=sys.stderr)
+                  print(
+                      "Resolve conflicts through the GitHub web UI or remove "
+                      "those entries from the ZIP.",
+                      file=sys.stderr
+                  )
                   sys.exit(1)
 
-              # ── 5. Extract into a staging dir OUTSIDE the repo ─────
+              # 6. Extract into staging outside the repository
               staging = runner_temp / "extract_staging"
               if staging.exists():
                   shutil.rmtree(staging)
               staging.mkdir(parents=True)
 
+              actual_total = 0
               try:
-                  # Create every directory first (covers empty dirs)
                   for d in target_dirs:
                       (staging / d).mkdir(parents=True, exist_ok=True)
-                  # Then files
+
                   for name, m in files.items():
                       rel = stripped(name, prefix)
-                      if rel in excluded:
+                      if rel.casefold() in excluded_casefold:
                           continue
+
                       dest = staging / rel
                       dest.parent.mkdir(parents=True, exist_ok=True)
+                      actual_file = 0
+
                       with zf.open(m) as src, open(dest, "wb") as dst:
-                          shutil.copyfileobj(src, dst)
+                          while True:
+                              chunk = src.read(65536)
+                              if not chunk:
+                                  break
+
+                              actual_file += len(chunk)
+                              if actual_file > MAX_ENTRY_UNCOMPRESSED:
+                                  raise RuntimeError(
+                                      f"{rel}: streamed bytes exceeded "
+                                      "per-file limit"
+                                  )
+
+                              actual_total += len(chunk)
+                              if actual_total > MAX_TOTAL_UNCOMPRESSED:
+                                  raise RuntimeError(
+                                      "Streamed bytes exceeded total limit"
+                                  )
+
+                              dst.write(chunk)
+
               except Exception as e:
                   shutil.rmtree(staging, ignore_errors=True)
                   fail(f"Extraction to staging failed: {e}")
 
-          # ── 6. Validate the staging tree ───────────────────────────
+          # 7. Validate staging tree
           staging_names = {
               p.relative_to(staging).as_posix()
-              for p in staging.rglob("*") if p.is_file()
+              for p in staging.rglob("*")
+              if p.is_file()
           }
-          if not root_marker_present(staging_names):
-              shutil.rmtree(staging, ignore_errors=True)
-              fail("Post-extraction validation failed: root markers missing in staging.")
 
-          # ── 7. Back up the ZIP before install ──────────────────────
-          backup_zip = runner_temp / f"zip_backup_{zip_path.name}"
+          if not has_marker(staging_names):
+              shutil.rmtree(staging, ignore_errors=True)
+              fail("Post-extraction validation failed: root markers missing.")
+
+          # 8. Back up ZIP before installation
+          backup_zip = runner_temp / "zip_backup.zip"
           try:
               shutil.copy2(zip_path, backup_zip)
           except Exception as e:
               shutil.rmtree(staging, ignore_errors=True)
               fail(f"Could not back up ZIP before install: {e}")
 
-          # ── 8. Install into repo with rollback ─────────────────────
-          def rollback(reason):
-              print(f"::error::Installation failed ({reason}); rolling back.",
-                    file=sys.stderr)
-              subprocess.run(
-                  ["git", "restore", "--source=HEAD", "--staged",
-                   "--worktree", "--", "."],
-                  check=False,
-              )
-              # -ffdx: also remove ignored files created by the install
-              # (build/, .gradle/, local.properties, etc.).  Safe here:
-              # the runner began from a fresh clone, so nothing ignored
-              # pre-existed in the worktree.
-              subprocess.run(["git", "clean", "-ffdx"], check=False)
-              if backup_zip.exists() and not zip_path.exists():
+          # 9. Install and track created paths
+          created_files = []
+          created_dirs = []
+
+          def ensure_dir(p):
+              missing = []
+              cur = p
+
+              while cur != repo_root:
+                  if cur.is_symlink():
+                      raise RuntimeError(
+                          f"Refusing to write through symlink: "
+                          f"{cur.relative_to(repo_root)}"
+                      )
+                  if cur.exists():
+                      if not cur.is_dir():
+                          raise RuntimeError(f"Not a directory: {cur}")
+                      break
+                  missing.append(cur)
+                  cur = cur.parent
+
+              for m in reversed(missing):
+                  m.mkdir(exist_ok=True)
+                  created_dirs.append(m.relative_to(repo_root).as_posix())
+
+          def inline_rollback():
+              for f in reversed(created_files):
                   try:
-                      shutil.copy2(backup_zip, zip_path)
-                  except Exception:
+                      p = repo_root / f
+                      if p.is_symlink() or p.is_file():
+                          p.unlink()
+                  except OSError:
+                      pass
+
+              for d in sorted(
+                  created_dirs,
+                  key=lambda x: x.count("/"),
+                  reverse=True
+              ):
+                  try:
+                      (repo_root / d).rmdir()
+                  except OSError:
                       pass
 
           try:
               for d in target_dirs:
-                  (repo_root / d).mkdir(parents=True, exist_ok=True)
+                  ensure_dir(repo_root / d)
+
               for src in staging.rglob("*"):
                   if not src.is_file():
                       continue
-                  rel = src.relative_to(staging).as_posix()
-                  if rel in excluded:
-                      continue
-                  dest = repo_root / rel
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(src, dest)
-          except Exception as e:
-              rollback(f"copy: {e}")
-              shutil.rmtree(staging, ignore_errors=True)
-              sys.exit(1)
 
-          # ── 9. Delete the ZIP inside the transaction ──────────────
+                  rel = src.relative_to(staging).as_posix()
+                  if rel.casefold() in excluded_casefold:
+                      continue
+
+                  dest = repo_root / rel
+                  if dest.is_symlink():
+                      raise RuntimeError(
+                          f"Refusing to overwrite symlink at install: {rel}"
+                      )
+
+                  ensure_dir(dest.parent)
+                  shutil.copy2(src, dest)
+                  created_files.append(rel)
+
+          except Exception as e:
+              inline_rollback()
+              shutil.rmtree(staging, ignore_errors=True)
+              fail(f"Install failed: {e}")
+
+          # 10. Delete ZIP inside transaction
           try:
               zip_path.unlink()
           except Exception as e:
-              rollback(f"unlink ZIP: {e}")
+              inline_rollback()
               shutil.rmtree(staging, ignore_errors=True)
-              sys.exit(1)
+              fail(f"ZIP unlink failed: {e}")
+
+          # 11. Write rollback manifest
+          manifest = runner_temp / "created_manifest.txt"
+          with open(manifest, "w") as f:
+              for p in created_files:
+                  f.write(f"F\t{p}\n")
+              for p in created_dirs:
+                  f.write(f"D\t{p}\n")
+              f.write(f"Z\t{rel_zip}\n")
 
           shutil.rmtree(staging, ignore_errors=True)
-          print("OK: staging extracted, validated, repo populated, ZIP removed. "
-                "Ready to commit.")
+          log(
+              "OK: staging extracted, validated, repo populated, ZIP removed. "
+              "Ready to commit."
+          )
           PY
 
-      - name: Commit and push
+      - name: Commit and push (single atomic commit)
         run: |
           set -euo pipefail
 
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "Nothing to commit — repository already up to date."
-            exit 0
+          rollback() {
+              local reason="$1"
+              local committed="$2"
+              echo "::error::Rollback: $reason" >&2
+
+              if [ "$committed" = "1" ]; then
+                  git reset --mixed HEAD~1 >/dev/null 2>&1 || true
+              else
+                  git reset --mixed HEAD >/dev/null 2>&1 || true
+              fi
+
+              python3 - <<'PY' || true
+          import os, sys, pathlib, shutil
+
+          rt = pathlib.Path(os.environ["RUNNER_TEMP"])
+          repo = pathlib.Path(".").resolve()
+          mf = rt / "created_manifest.txt"
+          zb = rt / "zip_backup.zip"
+
+          if not mf.exists():
+              sys.exit(0)
+
+          files, dirs, zip_rel = [], [], ""
+          for line in mf.read_text().splitlines():
+              kind, path = line.split("\t", 1)
+              if kind == "F":
+                  files.append(path)
+              elif kind == "D":
+                  dirs.append(path)
+              elif kind == "Z":
+                  zip_rel = path
+
+          for f in reversed(files):
+              try:
+                  p = repo / f
+                  if p.is_symlink() or p.is_file():
+                      p.unlink()
+              except OSError as e:
+                  print(f"rollback: {f}: {e}", file=sys.stderr)
+
+          for d in sorted(dirs, key=lambda x: x.count("/"), reverse=True):
+              try:
+                  (repo / d).rmdir()
+              except OSError:
+                  pass
+
+          if zip_rel and zb.exists():
+              zp = repo / zip_rel
+              if not zp.exists():
+                  try:
+                      zp.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(zb, zp)
+                      print(
+                          f"rollback: restored {zip_rel} from backup",
+                          file=sys.stderr
+                      )
+                  except Exception as e:
+                      print(
+                          f"rollback: FAILED to restore ZIP: {e}",
+                          file=sys.stderr
+                      )
+          PY
+          }
+
+          if ! git add -A; then
+              rollback "git add failed" 0
+              exit 1
           fi
 
-          git add -A
+          if git diff --cached --quiet; then
+              echo "Nothing to commit — repository already up to date."
+              exit 0
+          fi
 
           if ! git commit -m "chore: extract project from ZIP and remove archive"; then
-            # set -e would abort on restore failure — never let it.
-            git restore --source=HEAD --staged --worktree -- . || true
-            git clean -ffdx || true
-            echo "::error::git commit failed; working tree rolled back."
-            exit 1
+              rollback "git commit failed" 0
+              exit 1
           fi
 
           if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
-            echo "::error::git push failed. The remote branch is unchanged; the original ZIP is NOT lost."
-            echo "Fix the cause (Settings → Actions → General → Workflow permissions, or branch protection) and re-run."
-            exit 1
+              echo "::error::git push failed." >&2
+              echo "A rejected push leaves the remote branch unchanged." >&2
+              echo "A network failure after server acceptance is ambiguous." >&2
+              echo "Check GitHub before re-running:" >&2
+              echo "  - Is the extraction commit present?" >&2
+              echo "  - Is the ZIP still present?" >&2
+              echo "If the extraction commit exists and the ZIP is gone, do not re-run." >&2
+              rollback "git push failed" 1
+              exit 1
           fi
 
           echo "OK: single commit pushed."
