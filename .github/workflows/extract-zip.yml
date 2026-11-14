@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       zip_path:
-        description: "Path to ZIP file relative to repository root (leave empty to auto-detect)"
+        description: 'Path to ZIP relative to repo root (blank = auto-detect in root)'
         required: false
         type: string
-        default: ""
+        default: ''
 
 permissions:
   contents: write
@@ -28,214 +28,354 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Locate ZIP file
-        id: locate
-        env:
-          INPUT_ZIP: ${{ inputs.zip_path }}
-        run: |
-          python3 - <<'PY'
-          import os, sys, pathlib
-
-          root = pathlib.Path(".")
-          input_zip = os.environ.get("INPUT_ZIP", "").strip()
-
-          if input_zip:
-              zpath = pathlib.Path(input_zip)
-              if not zpath.exists() or not zpath.is_file():
-                  sys.exit(f"❌ Specified ZIP not found: {input_zip}")
-              if zpath.suffix.lower() != ".zip":
-                  sys.exit(f"❌ Not a .zip file: {input_zip}")
-              print(f"ZIP_PATH={zpath.as_posix()}")
-              sys.exit(0)
-
-          zips = [
-              p for p in root.rglob("*")
-              if p.is_file() and p.suffix.lower() == ".zip"
-          ]
-
-          if not zips:
-              sys.exit("❌ No .zip file found anywhere in the repository.")
-
-          if len(zips) > 1:
-              sys.exit(
-                  "❌ Multiple ZIP files found. Please set the 'zip_path' input to one of:\n"
-                  + "\n".join(f"  - {p.as_posix()}" for p in zips)
-              )
-
-          print(f"ZIP_PATH={zips[0].as_posix()}")
-          PY
-        # The Python block above prints ZIP_PATH=... to stdout.
-        # We capture it via shell redirection below.
-        # (GitHub Actions does not allow setting outputs directly from Python stdout,
-        #  so we use a two-step approach.)
-
-      - name: Resolve ZIP path to env
-        id: resolve
-        run: |
-          # Re-run the detection logic and export to GITHUB_OUTPUT
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import os, pathlib, sys
-
-          root = pathlib.Path(".")
-          input_zip = os.environ.get("INPUT_ZIP", "").strip()
-
-          if input_zip:
-              zpath = pathlib.Path(input_zip)
-              if not zpath.exists() or not zpath.is_file() or zpath.suffix.lower() != ".zip":
-                  sys.exit(1)
-              print(f"zip_path={zpath.as_posix()}")
-              sys.exit(0)
-
-          zips = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".zip"]
-          if len(zips) == 0:
-              sys.exit(1)
-          if len(zips) > 1:
-              sys.exit(1)
-          print(f"zip_path={zips[0].as_posix()}")
-          PY
-        env:
-          INPUT_ZIP: ${{ inputs.zip_path }}
-
-      - name: Safe extract and validate
+      - name: Extract, validate, install (transactional)
         id: extract
         env:
-          ZIP_PATH: ${{ steps.resolve.outputs.zip_path }}
+          INPUT_ZIP: ${{ inputs.zip_path }}
+          WORKFLOW_FILE: .github/workflows/extract-zip.yml
         run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import os, sys, zipfile, pathlib, shutil, tempfile
+          import os, sys, zipfile, pathlib, shutil, stat, subprocess
 
-          zip_path = pathlib.Path(os.environ["ZIP_PATH"])
-          if not zip_path.exists():
-              sys.exit(f"❌ ZIP disappeared: {zip_path}")
+          repo_root      = pathlib.Path(".").resolve()
+          zip_input      = (os.environ.get("INPUT_ZIP") or "").strip()
+          workflow_file  = os.environ.get("WORKFLOW_FILE", "")
+          runner_temp    = pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
 
-          repo_root = pathlib.Path(".").resolve()
+          def fail(msg):
+              print(f"::error::{msg}", file=sys.stderr)
+              sys.exit(1)
 
-          # 1) Validate every member BEFORE extracting anything (Zip Slip protection)
-          with zipfile.ZipFile(zip_path) as zf:
+          # ── 1. Locate the ZIP exactly once ─────────────────────────
+          if zip_input:
+              zip_path = (repo_root / zip_input).resolve()
+              try:
+                  zip_path.relative_to(repo_root)
+              except ValueError:
+                  fail(f"zip_path must be inside the repository: {zip_input}")
+              if not zip_path.is_file():
+                  fail(f"ZIP not found: {zip_input}")
+              if zip_path.suffix.lower() != ".zip":
+                  fail(f"Not a .zip file: {zip_input}")
+          else:
+              zips = sorted(
+                  p for p in repo_root.iterdir()
+                  if p.is_file() and p.suffix.lower() == ".zip"
+              )
+              if not zips:
+                  fail("No .zip file in repository root. "
+                       "Upload one or set the zip_path input.")
+              if len(zips) > 1:
+                  fail("Multiple .zip files in repository root: "
+                       + ", ".join(p.name for p in zips)
+                       + ". Set the zip_path input to choose one.")
+              zip_path = zips[0]
+
+          rel_zip = zip_path.relative_to(repo_root).as_posix()
+          print(f"Found ZIP: {rel_zip}")
+
+          if os.environ.get("GITHUB_OUTPUT"):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"zip_path={rel_zip}\n")
+
+          # ── 2. Open and validate every archive member ──────────────
+          try:
+              zf = zipfile.ZipFile(zip_path)
+          except zipfile.BadZipFile as e:
+              fail(f"Cannot open ZIP: {e}")
+
+          PROTECTED_TOP = {".git"}
+
+          with zf:
               bad = zf.testzip()
               if bad is not None:
-                  sys.exit(f"❌ Corrupt ZIP entry: {bad}")
+                  fail(f"Corrupt ZIP member: {bad}")
 
-              members = zf.infolist()
-              if not members:
-                  sys.exit("❌ ZIP is empty.")
+              infos = zf.infolist()
+              if not infos:
+                  fail("ZIP is empty.")
 
-              for m in members:
-                  # Resolve target path and ensure it stays inside repo_root
-                  target = (repo_root / m.filename).resolve()
-                  try:
-                      target.relative_to(repo_root)
-                  except ValueError:
-                      sys.exit(
-                          f"❌ ZIP path traversal detected: {m.filename!r} "
-                          f"would escape {repo_root}"
-                      )
+              files  = {}
+              dirs   = set()
 
-              # 2) Extract into a temporary staging directory first
-              staging = pathlib.Path(tempfile.mkdtemp(prefix="unzip_", dir=repo_root))
+              for m in infos:
+                  name = m.filename
+
+                  # NUL / control characters
+                  if any(ord(c) < 0x20 for c in name):
+                      fail(f"Control character in ZIP path: {name!r}")
+
+                  if name.startswith("/"):
+                      fail(f"Absolute path in ZIP: {name!r}")
+                  if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
+                      fail(f"Windows drive-letter path in ZIP: {name!r}")
+                  if "\\" in name:
+                      fail(f"Backslash in ZIP path: {name!r}")
+
+                  parts = name.rstrip("/").split("/")
+                  if any(p == ".." for p in parts):
+                      fail(f"'..' path component in ZIP: {name!r}")
+                  if any(p == "." for p in parts):
+                      fail(f"'.' path component in ZIP: {name!r}")
+                  if any(p == "" for p in parts):
+                      fail(f"Empty path component in ZIP: {name!r}")
+
+                  # Reject every Unix-special file type.  Modes with only
+                  # permission bits (e.g. 0o644, 0o600 from writestr())
+                  # return False for all S_IS* checks, so Python-generated
+                  # ZIPs are unaffected.
+                  mode = (m.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(mode):
+                      fail(f"Symlink in ZIP: {name!r}. Refusing to extract.")
+                  if stat.S_ISFIFO(mode):
+                      fail(f"FIFO in ZIP: {name!r}. Refusing to extract.")
+                  if stat.S_ISSOCK(mode):
+                      fail(f"Socket in ZIP: {name!r}. Refusing to extract.")
+                  if stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
+                      fail(f"Device file in ZIP: {name!r}. Refusing to extract.")
+
+                  if parts[0] in PROTECTED_TOP:
+                      fail(f"ZIP touches protected path {parts[0]!r}: {name!r}")
+
+                  if name.endswith("/"):
+                      dirs.add(name.rstrip("/"))
+                  else:
+                      if name in files:
+                          fail(f"Duplicate file entry in ZIP: {name!r}")
+                      files[name] = m
+                      for i in range(1, len(parts)):
+                          dirs.add("/".join(parts[:i]))
+
+              lower = {}
+              for n in files:
+                  k = n.lower()
+                  if k in lower:
+                      fail(f"Case-insensitive collision in ZIP: "
+                           f"{n!r} vs {lower[k]!r}")
+                  lower[k] = n
+
+              both = set(files) & dirs
+              if both:
+                  fail("Archive path is both file and directory: "
+                       f"{sorted(both)[:10]}")
+
+              all_names = sorted(files)
+
+              # ── 3. Strip redundant top-level folder(s) ─────────────
+              ROOT_MARKERS = {
+                  "settings.gradle", "settings.gradle.kts",
+                  "build.gradle",    "build.gradle.kts",
+              }
+
+              def stripped(name, prefix):
+                  return (name[len(prefix) + 1:]
+                          if prefix and name.startswith(prefix + "/")
+                          else name)
+
+              def root_marker_present(names):
+                  return any(("/" not in n) and (n in ROOT_MARKERS)
+                             for n in names)
+
+              prefix = ""
+              for _ in range(3):
+                  cur = [stripped(n, prefix) for n in all_names]
+                  if root_marker_present(cur):
+                      break
+                  tops = {n.split("/")[0] for n in cur}
+                  if len(tops) != 1:
+                      break
+                  only = next(iter(tops))
+                  if not all(n == only or n.startswith(only + "/") for n in cur):
+                      break
+                  if not any(n.startswith(only + "/") for n in cur):
+                      break
+                  prefix = f"{prefix}/{only}" if prefix else only
+
+              final_names = [stripped(n, prefix) for n in all_names]
+
+              if not root_marker_present(final_names):
+                  tops = sorted({n.split("/")[0] for n in final_names})[:20]
+                  fail("ZIP does not look like an Android/Gradle project: "
+                       "no settings.gradle{,.kts} or build.gradle{,.kts} "
+                       f"at project root (after stripping '{prefix or '<none>'}'). "
+                       f"Top-level entries: {tops}")
+
+              print(f"Project prefix stripped: {prefix or '<none>'}")
+
+              if workflow_file and workflow_file in final_names:
+                  print(f"WARNING: ZIP contains {workflow_file}; it will be "
+                        f"ignored to avoid replacing the running workflow.",
+                        file=sys.stderr)
+
+              # ── 4. Conflict report against current working tree ────
+              excluded = {rel_zip, workflow_file}
+
+              target_files = [n for n in final_names if n not in excluded]
+
+              # Explicit empty directories from the archive (after strip)
+              target_dirs = set()
+              for d in dirs:
+                  rel = stripped(d, prefix)
+                  if not rel or rel in excluded:
+                      continue
+                  target_dirs.add(rel)
+
+              # Ancestors of every file we will create
+              for n in target_files:
+                  parts = n.split("/")
+                  for i in range(1, len(parts)):
+                      target_dirs.add("/".join(parts[:i]))
+
+              conflicts = []
+
+              for n in target_files:
+                  p = repo_root / n
+                  if p.is_symlink() or p.is_file():
+                      conflicts.append(("would-overwrite-existing-file", n))
+                  elif p.is_dir():
+                      conflicts.append(("existing-directory-blocks-archive-file", n))
+
+              for d in target_dirs:
+                  p = repo_root / d
+                  if p.is_symlink() or p.is_file():
+                      conflicts.append(("existing-file-blocks-archive-directory", d))
+
+              if conflicts:
+                  print("", file=sys.stderr)
+                  print("=" * 64, file=sys.stderr)
+                  print("CONFLICT — installation would break the following paths:",
+                        file=sys.stderr)
+                  print("=" * 64, file=sys.stderr)
+                  for kind, path in sorted(set(conflicts)):
+                      print(f"  [{kind}] {path}", file=sys.stderr)
+                  print("", file=sys.stderr)
+                  print("No files were changed and the ZIP is intact.",
+                        file=sys.stderr)
+                  print("", file=sys.stderr)
+                  print("To resolve, choose one:", file=sys.stderr)
+                  print("  A. Delete the listed repo files/directories via the",
+                        file=sys.stderr)
+                  print("     GitHub web UI, commit, then re-run this workflow.",
+                        file=sys.stderr)
+                  print("  B. Or remove those paths from the ZIP and re-upload it",
+                        file=sys.stderr)
+                  print("     if the repository copies should win.", file=sys.stderr)
+                  sys.exit(1)
+
+              # ── 5. Extract into a staging dir OUTSIDE the repo ─────
+              staging = runner_temp / "extract_staging"
+              if staging.exists():
+                  shutil.rmtree(staging)
+              staging.mkdir(parents=True)
+
               try:
-                  zf.extractall(path=staging)
+                  # Create every directory first (covers empty dirs)
+                  for d in target_dirs:
+                      (staging / d).mkdir(parents=True, exist_ok=True)
+                  # Then files
+                  for name, m in files.items():
+                      rel = stripped(name, prefix)
+                      if rel in excluded:
+                          continue
+                      dest = staging / rel
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      with zf.open(m) as src, open(dest, "wb") as dst:
+                          shutil.copyfileobj(src, dst)
               except Exception as e:
                   shutil.rmtree(staging, ignore_errors=True)
-                  sys.exit(f"❌ Extraction failed: {e}")
+                  fail(f"Extraction to staging failed: {e}")
 
-          # 3) Detect single top-level folder
-          children = list(staging.iterdir())
-          top_level_dirs = [c for c in children if c.is_dir() and not c.is_symlink()]
-          top_level_files = [c for c in children if not c.is_dir() or c.is_symlink()]
-
-          if len(children) == 1 and len(top_level_dirs) == 1:
-              # ZIP contains exactly one top-level folder: move its contents up
-              project_root = top_level_dirs[0]
-              source_items = list(project_root.iterdir())
-          else:
-              # ZIP contains files directly at root (or mixed): use staging as root
-              project_root = staging
-              source_items = children
-
-          if not source_items:
-              shutil.rmtree(staging, ignore_errors=True)
-              sys.exit("❌ No files found after extraction.")
-
-          # 4) Validate: ensure at least one recognizable project file exists
-          names = {p.name.lower() for p in source_items if p.is_file()}
-          # Android project markers (at least one should be present)
-          markers = {
-              "build.gradle", "build.gradle.kts", "settings.gradle",
-              "settings.gradle.kts", "gradlew", "androidmanifest.xml",
-              "gradle.properties"
+          # ── 6. Validate the staging tree ───────────────────────────
+          staging_names = {
+              p.relative_to(staging).as_posix()
+              for p in staging.rglob("*") if p.is_file()
           }
-          if not (names & markers):
+          if not root_marker_present(staging_names):
               shutil.rmtree(staging, ignore_errors=True)
-              sys.exit(
-                  "❌ Extracted content does not look like an Android project. "
-                  f"Top-level files: {sorted(names)[:20]}"
-              )
+              fail("Post-extraction validation failed: root markers missing in staging.")
 
-          # 5) Copy into repository root WITHOUT deleting existing unrelated files
-          #    Existing files with the same name will be overwritten.
-          print("Copying extracted files into repository root…")
-          for item in source_items:
-              dest = repo_root / item.name
-              if item.is_dir():
-                  if dest.exists() and not dest.is_dir():
-                      shutil.rmtree(dest, ignore_errors=True)
-                  shutil.copytree(item, dest, dirs_exist_ok=True)
-              else:
-                  if dest.exists() and dest.is_dir():
-                      shutil.rmtree(dest, ignore_errors=True)
-                  shutil.copy2(item, dest)
+          # ── 7. Back up the ZIP before install ──────────────────────
+          backup_zip = runner_temp / f"zip_backup_{zip_path.name}"
+          try:
+              shutil.copy2(zip_path, backup_zip)
+          except Exception as e:
+              shutil.rmtree(staging, ignore_errors=True)
+              fail(f"Could not back up ZIP before install: {e}")
+
+          # ── 8. Install into repo with rollback ─────────────────────
+          def rollback(reason):
+              print(f"::error::Installation failed ({reason}); rolling back.",
+                    file=sys.stderr)
+              subprocess.run(
+                  ["git", "restore", "--source=HEAD", "--staged",
+                   "--worktree", "--", "."],
+                  check=False,
+              )
+              # -ffdx: also remove ignored files created by the install
+              # (build/, .gradle/, local.properties, etc.).  Safe here:
+              # the runner began from a fresh clone, so nothing ignored
+              # pre-existed in the worktree.
+              subprocess.run(["git", "clean", "-ffdx"], check=False)
+              if backup_zip.exists() and not zip_path.exists():
+                  try:
+                      shutil.copy2(backup_zip, zip_path)
+                  except Exception:
+                      pass
+
+          try:
+              for d in target_dirs:
+                  (repo_root / d).mkdir(parents=True, exist_ok=True)
+              for src in staging.rglob("*"):
+                  if not src.is_file():
+                      continue
+                  rel = src.relative_to(staging).as_posix()
+                  if rel in excluded:
+                      continue
+                  dest = repo_root / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dest)
+          except Exception as e:
+              rollback(f"copy: {e}")
+              shutil.rmtree(staging, ignore_errors=True)
+              sys.exit(1)
+
+          # ── 9. Delete the ZIP inside the transaction ──────────────
+          try:
+              zip_path.unlink()
+          except Exception as e:
+              rollback(f"unlink ZIP: {e}")
+              shutil.rmtree(staging, ignore_errors=True)
+              sys.exit(1)
 
           shutil.rmtree(staging, ignore_errors=True)
-
-          # 6) Validate that the repository now contains the project
-          if not any((repo_root / m).exists() for m in markers):
-              sys.exit("❌ Post-copy validation failed: Android project markers missing.")
-
-          print("✅ Extraction and validation successful.")
+          print("OK: staging extracted, validated, repo populated, ZIP removed. "
+                "Ready to commit.")
           PY
 
       - name: Commit and push
         run: |
           set -euo pipefail
 
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Nothing to commit — repository already up to date."
+            exit 0
+          fi
+
           git add -A
 
-          if git diff --cached --quiet; then
-            echo "ℹ️ No changes to commit."
-            exit 0
+          if ! git commit -m "chore: extract project from ZIP and remove archive"; then
+            # set -e would abort on restore failure — never let it.
+            git restore --source=HEAD --staged --worktree -- . || true
+            git clean -ffdx || true
+            echo "::error::git commit failed; working tree rolled back."
+            exit 1
           fi
 
-          git commit -m "chore: extract uploaded ZIP project"
-
-          # GITHUB_TOKEN with contents: write is sufficient for pushing
-          git push origin HEAD:${{ github.ref_name }}
-
-      - name: Remove original ZIP (only after successful commit)
-        env:
-          ZIP_PATH: ${{ steps.resolve.outputs.zip_path }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "${ZIP_PATH:-}" ]; then
-            echo "ℹ️ No ZIP path resolved; skipping removal."
-            exit 0
+          if ! git push origin "HEAD:${GITHUB_REF_NAME}"; then
+            echo "::error::git push failed. The remote branch is unchanged; the original ZIP is NOT lost."
+            echo "Fix the cause (Settings → Actions → General → Workflow permissions, or branch protection) and re-run."
+            exit 1
           fi
 
-          if [ ! -f "$ZIP_PATH" ]; then
-            echo "ℹ️ ZIP already removed; nothing to do."
-            exit 0
-          fi
-
-          # Safety: the ZIP must be inside the repository
-          repo_root="$(pwd)"
-          real_zip="$(realpath "$ZIP_PATH")"
-          case "$real_zip" in
-            "$repo_root"/*) ;;
-            *) echo "❌ Refusing to delete ZIP outside repository."; exit 1 ;;
-          esac
-
-          git rm --quiet -- "$ZIP_PATH"
-          git commit -m "chore: remove original ZIP after successful extraction"
-          git push origin HEAD:${{ github.ref_name }}
-          echo "✅ Original ZIP removed and committed."
+          echo "OK: single commit pushed."
